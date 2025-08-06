@@ -272,8 +272,6 @@ struct swap_info_struct {
 					 */
 	struct work_struct discard_work; /* discard worker */
 	struct swap_cluster_list discard_clusters; /* discard clusters list */
-	unsigned int write_pending;
-	unsigned int max_writes;
 	struct plist_node avail_lists[0]; /*
 					   * entries in swap_avail_heads, one
 					   * entry per node.
@@ -307,7 +305,7 @@ struct vma_swap_readahead {
 
 /* linux/mm/workingset.c */
 void *workingset_eviction(struct address_space *mapping, struct page *page);
-void workingset_refault(struct page *page, void *shadow);
+bool workingset_refault(void *shadow);
 void workingset_activation(struct page *page);
 
 /* Do not use directly, use workingset_lookup_update */
@@ -348,14 +346,8 @@ extern void deactivate_file_page(struct page *page);
 extern void mark_page_lazyfree(struct page *page);
 extern void swap_setup(void);
 
-extern void __lru_cache_add_active_or_unevictable(struct page *page,
-						unsigned long vma_flags);
-
-static inline void lru_cache_add_active_or_unevictable(struct page *page,
-						struct vm_area_struct *vma)
-{
-	return __lru_cache_add_active_or_unevictable(page, vma->vm_flags);
-}
+extern void lru_cache_add_active_or_unevictable(struct page *page,
+						struct vm_area_struct *vma);
 
 /* linux/mm/vmscan.c */
 extern unsigned long zone_reclaimable_pages(struct zone *zone);
@@ -437,7 +429,6 @@ extern struct page *swap_cluster_readahead(swp_entry_t entry, gfp_t flag,
 extern struct page *swapin_readahead(swp_entry_t entry, gfp_t flag,
 				struct vm_fault *vmf);
 
-extern bool swap_use_vma_readmore(void);
 /* linux/mm/swapfile.c */
 extern atomic_long_t nr_swap_pages;
 extern long total_swap_pages;
@@ -628,7 +619,7 @@ static inline int split_swap_cluster(swp_entry_t entry)
 }
 #endif
 
-#if defined(CONFIG_MEMCG) && !defined(CONFIG_MEMCG_FORCE_USE_VM_SWAPPINESS)
+#ifdef CONFIG_MEMCG
 static inline int mem_cgroup_swappiness(struct mem_cgroup *memcg)
 {
 	/* Cgroup2 doesn't have per-cgroup swappiness */

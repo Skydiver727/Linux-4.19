@@ -21,11 +21,6 @@ menuconfig STAGING
 
 	  If in doubt, say N here.
 
-config TOUCHSCREEN_MTK
-	bool "for samsong driver"
-	default y
-	help
-	 This test
 
 if STAGING
 
@@ -126,5 +121,7 @@ source "drivers/staging/mt7621-dts/Kconfig"
 source "drivers/staging/gasket/Kconfig"
 
 source "drivers/staging/axis-fifo/Kconfig"
+
+source "drivers/staging/erofs/Kconfig"
 
 endif # STAGING

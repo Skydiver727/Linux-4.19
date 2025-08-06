@@ -9,7 +9,6 @@
 #include <linux/device.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
-#include <linux/property.h>
 #include <linux/slab.h>
 
 #include "bus.h"
@@ -205,32 +204,15 @@ static void typec_altmode_put_partner(struct altmode *altmode)
 	put_device(&adev->dev);
 }
 
-static int typec_port_fwnode_match(struct device *dev, const void *fwnode)
-{
-	return dev_fwnode(dev) == fwnode;
-}
-
-static int typec_port_name_match(struct device *dev, const void *name)
+static int __typec_port_match(struct device *dev, const void *name)
 {
 	return !strcmp((const char *)name, dev_name(dev));
 }
 
 static void *typec_port_match(struct device_connection *con, int ep, void *data)
 {
-	struct device *dev;
-
-	/*
-	 * FIXME: Check does the fwnode supports the requested SVID. If it does
-	 * we need to return ERR_PTR(-PROBE_DEFER) when there is no device.
-	 */
-	if (con->fwnode)
-		return class_find_device(typec_class, NULL, con->fwnode,
-					 typec_port_fwnode_match);
-
-	dev = class_find_device(typec_class, NULL, con->endpoint[ep],
-				typec_port_name_match);
-
-	return dev ? dev : ERR_PTR(-EPROBE_DEFER);
+	return class_find_device(typec_class, NULL, con->endpoint[ep],
+				 __typec_port_match);
 }
 
 struct typec_altmode *
@@ -295,7 +277,7 @@ void typec_altmode_update_active(struct typec_altmode *adev, bool active)
 	if (adev->active == active)
 		return;
 
-	if (!is_typec_port(adev->dev.parent) && adev->dev.driver) {
+	if (!is_typec_port(adev->dev.parent)) {
 		if (!active)
 			module_put(adev->dev.driver->owner);
 		else
@@ -1114,11 +1096,7 @@ port_type_store(struct device *dev, struct device_attribute *attr,
 	int ret;
 	enum typec_port_type type;
 
-#if defined (CONFIG_N23_CHARGER_PRIVATE)
-	if (!port->cap->port_type_set) {
-#else
 	if (!port->cap->port_type_set || port->cap->type != TYPEC_PORT_DRP) {
-#endif
 		dev_dbg(dev, "changing port type not supported\n");
 		return -EOPNOTSUPP;
 	}
@@ -1129,10 +1107,7 @@ port_type_store(struct device *dev, struct device_attribute *attr,
 
 	type = ret;
 	mutex_lock(&port->port_type_lock);
-#if defined (CONFIG_N23_CHARGER_PRIVATE)
-	pr_info("%s port_type(%s) type(%s)\n", __func__,
-		typec_port_power_roles[port->port_type], typec_port_power_roles[type]);
-#endif
+
 	if (port->port_type == type) {
 		ret = size;
 		goto unlock_and_ret;
@@ -1176,10 +1151,8 @@ static ssize_t power_operation_mode_show(struct device *dev,
 					 char *buf)
 {
 	struct typec_port *port = to_typec_port(dev);
-	if (!IS_ERR_OR_NULL(port) && !IS_ERR_OR_NULL(&(port->pwr_opmode)) && (port->pwr_opmode) > 0 && (port->pwr_opmode) < 4)
-		return sprintf(buf, "%s\n", typec_pwr_opmodes[port->pwr_opmode]);
-	else
-		return sprintf(buf, "%s\n", typec_pwr_opmodes[0]);
+
+	return sprintf(buf, "%s\n", typec_pwr_opmodes[port->pwr_opmode]);
 }
 static DEVICE_ATTR_RO(power_operation_mode);
 
@@ -1402,7 +1375,6 @@ void typec_set_pwr_opmode(struct typec_port *port,
 			partner->usb_pd = 1;
 			sysfs_notify(&partner_dev->kobj, NULL,
 				     "supports_usb_power_delivery");
-			kobject_uevent(&port->dev.kobj, KOBJ_CHANGE);
 		}
 		put_device(partner_dev);
 	}
@@ -1524,8 +1496,11 @@ typec_port_register_altmode(struct typec_port *port,
 {
 	struct typec_altmode *adev;
 	struct typec_mux *mux;
+	char id[10];
 
-	mux = typec_mux_get(&port->dev, desc);
+	sprintf(id, "id%04xm%02x", desc->svid, desc->mode);
+
+	mux = typec_mux_get(&port->dev, id);
 	if (IS_ERR(mux))
 		return ERR_CAST(mux);
 
@@ -1619,7 +1594,7 @@ struct typec_port *typec_register_port(struct device *parent,
 		return ERR_PTR(ret);
 	}
 
-	port->mux = typec_mux_get(&port->dev, NULL);
+	port->mux = typec_mux_get(&port->dev, "typec-mux");
 	if (IS_ERR(port->mux)) {
 		ret = PTR_ERR(port->mux);
 		put_device(&port->dev);
@@ -1658,25 +1633,13 @@ static int __init typec_init(void)
 	if (ret)
 		return ret;
 
-	ret = class_register(&typec_mux_class);
-	if (ret)
-		goto err_unregister_bus;
-
 	typec_class = class_create(THIS_MODULE, "typec");
 	if (IS_ERR(typec_class)) {
-		ret = PTR_ERR(typec_class);
-		goto err_unregister_mux_class;
+		bus_unregister(&typec_bus);
+		return PTR_ERR(typec_class);
 	}
 
 	return 0;
-
-err_unregister_mux_class:
-	class_unregister(&typec_mux_class);
-
-err_unregister_bus:
-	bus_unregister(&typec_bus);
-
-	return ret;
 }
 subsys_initcall(typec_init);
 
@@ -1685,7 +1648,6 @@ static void __exit typec_exit(void)
 	class_destroy(typec_class);
 	ida_destroy(&typec_index_ida);
 	bus_unregister(&typec_bus);
-	class_unregister(&typec_mux_class);
 }
 module_exit(typec_exit);
 

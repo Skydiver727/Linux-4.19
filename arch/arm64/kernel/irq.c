@@ -30,7 +30,6 @@
 #include <linux/seq_file.h>
 #include <linux/vmalloc.h>
 #include <asm/vmap_stack.h>
-#include <asm/scs.h>
 
 unsigned long irq_err_count;
 
@@ -38,7 +37,6 @@ unsigned long irq_err_count;
 DEFINE_PER_CPU(struct nmi_ctx, nmi_contexts);
 
 DEFINE_PER_CPU(unsigned long *, irq_stack_ptr);
-EXPORT_PER_CPU_SYMBOL_GPL(irq_stack_ptr);
 
 int arch_show_interrupts(struct seq_file *p, int prec)
 {
@@ -74,7 +72,6 @@ static void init_irq_stacks(void)
 void __init init_IRQ(void)
 {
 	init_irq_stacks();
-	scs_init_irq();
 	irqchip_init();
 	if (!handle_arch_irq)
 		panic("No interrupt controller found.");

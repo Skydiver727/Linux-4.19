@@ -22,7 +22,6 @@
 #include <linux/writeback.h>
 #include <linux/frontswap.h>
 #include <linux/blkdev.h>
-#include <linux/psi.h>
 #include <linux/uio.h>
 #include <linux/sched/task.h>
 #include <asm/pgtable.h>
@@ -63,11 +62,9 @@ void end_swap_bio_write(struct bio *bio)
 		 * Also clear PG_reclaim to avoid rotate_reclaimable_page()
 		 */
 		set_page_dirty(page);
-#ifndef CONFIG_ZRAM
 		pr_alert("Write-error on swap-device (%u:%u:%llu)\n",
 			 MAJOR(bio_dev(bio)), MINOR(bio_dev(bio)),
 			 (unsigned long long)bio->bi_iter.bi_sector);
-#endif
 		ClearPageReclaim(page);
 	}
 	end_page_writeback(page);
@@ -354,19 +351,10 @@ int swap_readpage(struct page *page, bool synchronous)
 	struct swap_info_struct *sis = page_swap_info(page);
 	blk_qc_t qc;
 	struct gendisk *disk;
-	unsigned long pflags;
 
 	VM_BUG_ON_PAGE(!PageSwapCache(page) && !synchronous, page);
 	VM_BUG_ON_PAGE(!PageLocked(page), page);
 	VM_BUG_ON_PAGE(PageUptodate(page), page);
-
-	/*
-	 * Count submission time as memory stall. When the device is congested,
-	 * or the submitting cgroup IO-throttled, submission can be a
-	 * significant part of overall IO time.
-	 */
-	psi_memstall_enter(&pflags);
-
 	if (frontswap_load(page) == 0) {
 		SetPageUptodate(page);
 		unlock_page(page);
@@ -380,7 +368,7 @@ int swap_readpage(struct page *page, bool synchronous)
 		ret = mapping->a_ops->readpage(swap_file, page);
 		if (!ret)
 			count_vm_event(PSWPIN);
-		goto out;
+		return ret;
 	}
 
 	ret = bdev_read_page(sis->bdev, map_swap_page(page, &sis->bdev), page);
@@ -391,7 +379,7 @@ int swap_readpage(struct page *page, bool synchronous)
 		}
 
 		count_vm_event(PSWPIN);
-		goto out;
+		return 0;
 	}
 
 	ret = 0;
@@ -424,7 +412,6 @@ int swap_readpage(struct page *page, bool synchronous)
 	bio_put(bio);
 
 out:
-	psi_memstall_leave(&pflags);
 	return ret;
 }
 

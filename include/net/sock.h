@@ -73,7 +73,6 @@
 #include <linux/net_tstamp.h>
 #include <net/smc.h>
 #include <net/l3mdev.h>
-#include <linux/android_kabi.h>
 
 /*
  * This structure really needs to be cleaned up.
@@ -510,15 +509,6 @@ struct sock {
 	void                    (*sk_destruct)(struct sock *sk);
 	struct sock_reuseport __rcu	*sk_reuseport_cb;
 	struct rcu_head		sk_rcu;
-
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
-	ANDROID_KABI_RESERVE(3);
-	ANDROID_KABI_RESERVE(4);
-	ANDROID_KABI_RESERVE(5);
-	ANDROID_KABI_RESERVE(6);
-	ANDROID_KABI_RESERVE(7);
-	ANDROID_KABI_RESERVE(8);
 };
 
 enum sk_pacing {
@@ -1873,12 +1863,19 @@ sk_dst_get(struct sock *sk)
 
 static inline void dst_negative_advice(struct sock *sk)
 {
-	struct dst_entry *dst = __sk_dst_get(sk);
- 
- 	sk_rethink_txhash(sk);
- 
-	if (dst && dst->ops->negative_advice)
-		dst->ops->negative_advice(sk, dst);
+	struct dst_entry *ndst, *dst = __sk_dst_get(sk);
+
+	sk_rethink_txhash(sk);
+
+	if (dst && dst->ops->negative_advice) {
+		ndst = dst->ops->negative_advice(dst);
+
+		if (ndst != dst) {
+			rcu_assign_pointer(sk->sk_dst_cache, ndst);
+			sk_tx_queue_clear(sk);
+			sk->sk_dst_pending_confirm = 0;
+		}
+	}
 }
 
 static inline void

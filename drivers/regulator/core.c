@@ -57,8 +57,6 @@ static LIST_HEAD(regulator_supply_alias_list);
 static bool has_full_constraints;
 
 static struct dentry *debugfs_root;
-//bug760445 , liangyiyi.wt, MODIFY, 2022/6/9, modify for solving the 2st dep camera leakage during standby
-int iovdd_alway_on=0;
 
 /*
  * struct regulator_map
@@ -133,12 +131,7 @@ static bool regulator_ops_is_valid(struct regulator_dev *rdev, int ops)
 		rdev_err(rdev, "no constraints\n");
 		return false;
 	}
-    //+bug760445 , liangyiyi.wt, MODIFY, 2022/6/9, modify for solving the 2st dep camera leakage during standby
-    if(!strcmp((char *)rdev->constraints->name, "vcamio") &&
-            iovdd_alway_on && (rdev->constraints->valid_ops_mask&REGULATOR_CHANGE_STATUS == 0)){
-        rdev->constraints->valid_ops_mask |= REGULATOR_CHANGE_STATUS;
-    }
-    //-bug760445 , liangyiyi.wt, MODIFY, 2022/6/9, modify for solving the 2st dep camera leakage during standby
+
 	if (rdev->constraints->valid_ops_mask & ops)
 		return true;
 
@@ -235,37 +228,6 @@ static void regulator_unlock_supply(struct regulator_dev *rdev)
 }
 
 /**
- * of_get_child_regulator - get a child regulator device node
- * based on supply name
- * @parent: Parent device node
- * @prop_name: Combination regulator supply name and "-supply"
- *
- * Traverse all child nodes.
- * Extract the child regulator device node corresponding to the supply name.
- * returns the device node corresponding to the regulator if found, else
- * returns NULL.
- */
-static struct device_node *of_get_child_regulator(struct device_node *parent,
-						  const char *prop_name)
-{
-	struct device_node *regnode = NULL;
-	struct device_node *child = NULL;
-
-	for_each_child_of_node(parent, child) {
-		regnode = of_parse_phandle(child, prop_name, 0);
-
-		if (!regnode) {
-			regnode = of_get_child_regulator(child, prop_name);
-			if (regnode)
-				return regnode;
-		} else {
-			return regnode;
-		}
-	}
-	return NULL;
-}
-
-/**
  * of_get_regulator - get a regulator device node based on supply name
  * @dev: Device pointer for the consumer (of regulator) device
  * @supply: regulator supply name
@@ -277,18 +239,14 @@ static struct device_node *of_get_child_regulator(struct device_node *parent,
 static struct device_node *of_get_regulator(struct device *dev, const char *supply)
 {
 	struct device_node *regnode = NULL;
-	char prop_name[256];
+	char prop_name[32]; /* 32 is max size of property name */
 
 	dev_dbg(dev, "Looking up %s-supply from device tree\n", supply);
 
-	snprintf(prop_name, sizeof(prop_name), "%s-supply", supply);
+	snprintf(prop_name, 32, "%s-supply", supply);
 	regnode = of_parse_phandle(dev->of_node, prop_name, 0);
 
 	if (!regnode) {
-		regnode = of_get_child_regulator(dev->of_node, prop_name);
-		if (regnode)
-			return regnode;
-
 		dev_dbg(dev, "Looking up %s property in node %pOF failed\n",
 				prop_name, dev->of_node);
 		return NULL;
@@ -773,7 +731,7 @@ static int drms_uA_update(struct regulator_dev *rdev)
 {
 	struct regulator *sibling;
 	int current_uA = 0, output_uV, input_uV, err;
-	unsigned int regulator_curr_mode, mode;
+	unsigned int mode;
 
 	lockdep_assert_held_once(&rdev->mutex);
 
@@ -832,14 +790,6 @@ static int drms_uA_update(struct regulator_dev *rdev)
 			rdev_err(rdev, "failed to get optimum mode @ %d uA %d -> %d uV\n",
 				 current_uA, input_uV, output_uV);
 			return err;
-		}
-		/* return if the same mode is requested */
-		if (rdev->desc->ops->get_mode) {
-			regulator_curr_mode = rdev->desc->ops->get_mode(rdev);
-			if (regulator_curr_mode == mode)
-				return 0;
-		} else {
-			return 0;
 		}
 
 		err = rdev->desc->ops->set_mode(rdev, mode);
@@ -2427,13 +2377,7 @@ static int _regulator_disable(struct regulator_dev *rdev)
 	if (WARN(rdev->use_count <= 0,
 		 "unbalanced disables for %s\n", rdev_get_name(rdev)))
 		return -EIO;
-    //+bug760445 , liangyiyi.wt, MODIFY, 2022/6/9, modify for solving the 2st dep camera leakage during standby
-    if(!strcmp((char *)rdev->constraints->name, "vcamio") &&
-            iovdd_alway_on && rdev->constraints->always_on == 0){
-        rdev->constraints->always_on =1;
-    }
-    //printk("iovdd_alway_on(%d) always_on(%d) name(%s)\n",iovdd_alway_on,rdev->constraints->always_on,rdev->constraints->name);
-    //-bug760445 , liangyiyi.wt, MODIFY, 2022/6/9, modify for solving the 2st dep camera leakage during standby
+
 	/* are we the last user and permitted to disable ? */
 	if (rdev->use_count == 1 &&
 	    (rdev->constraints && !rdev->constraints->always_on)) {
@@ -4514,8 +4458,6 @@ regulator_register(const struct regulator_desc *regulator_desc,
 	}
 
 	rdev_init_debugfs(rdev);
-	rdev->proxy_consumer = regulator_proxy_consumer_register(dev,
-							config->of_node);
 
 	/* try to resolve regulators supply since a new one was registered */
 	class_for_each_device(&regulator_class, NULL, NULL,
@@ -4555,7 +4497,6 @@ void regulator_unregister(struct regulator_dev *rdev)
 			regulator_disable(rdev->supply);
 		regulator_put(rdev->supply);
 	}
-	regulator_proxy_consumer_unregister(rdev->proxy_consumer);
 	mutex_lock(&regulator_list_mutex);
 	debugfs_remove_recursive(rdev->debugfs);
 	flush_work(&rdev->disable_work.work);
@@ -4567,30 +4508,6 @@ void regulator_unregister(struct regulator_dev *rdev)
 	device_unregister(&rdev->dev);
 }
 EXPORT_SYMBOL_GPL(regulator_unregister);
-
-static int regulator_sync_supply(struct device *dev, void *data)
-{
-	struct regulator_dev *rdev = dev_to_rdev(dev);
-
-	if (rdev->dev.parent != data)
-		return 0;
-
-	if (!rdev->proxy_consumer)
-		return 0;
-
-	dev_dbg(data, "Removing regulator proxy consumer requests\n");
-	regulator_proxy_consumer_unregister(rdev->proxy_consumer);
-	rdev->proxy_consumer = NULL;
-
-	return 0;
-}
-
-void regulator_sync_state(struct device *dev)
-{
-	class_for_each_device(&regulator_class, NULL, dev,
-			      regulator_sync_supply);
-}
-EXPORT_SYMBOL_GPL(regulator_sync_state);
 
 #ifdef CONFIG_SUSPEND
 static int _regulator_suspend(struct device *dev, void *data)
@@ -4953,12 +4870,8 @@ static int regulator_late_cleanup(struct device *dev, void *data)
 
 	if (!enabled)
 		goto unlock;
-//bug 782977, linaiyu.wt, add, 2022.08.18, keep vbus detect Pen Driver after restarting
-#if defined(CONFIG_WT_PROJECT_S96516SA1) || defined(CONFIG_WT_PROJECT_S96616AA1)
-	if (have_full_constraints()&& strcmp(rdev->desc->name, "usb-otg-vbus")) {
-#else
+
 	if (have_full_constraints()) {
-#endif
 		/* We log since this may kill the system if it goes
 		 * wrong. */
 		rdev_info(rdev, "disabling\n");

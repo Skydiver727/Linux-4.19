@@ -39,15 +39,11 @@
 #include <asm/exception.h>
 #include <asm/debug-monitors.h>
 #include <asm/esr.h>
-#include <asm/kasan.h>
 #include <asm/sysreg.h>
 #include <asm/system_misc.h>
 #include <asm/pgtable.h>
 #include <asm/tlbflush.h>
 #include <asm/traps.h>
-#ifdef CONFIG_SEC_DEBUG_EXTRA_INFO
-#include <linux/sec_debug.h>
-#endif
 
 #include <acpi/ghes.h>
 
@@ -129,18 +125,6 @@ static void mem_abort_decode(unsigned int esr)
 		data_abort_decode(esr);
 }
 
-static inline bool is_ttbr0_addr(unsigned long addr)
-{
-	/* entry assembly clears tags for TTBR0 addrs */
-	return addr < TASK_SIZE;
-}
-
-static inline bool is_ttbr1_addr(unsigned long addr)
-{
-	/* TTBR1 addresses may have a tag if KASAN_SW_TAGS is in use */
-	return arch_kasan_reset_tag(addr) >= VA_START;
-}
-
 /*
  * Dump out the page tables associated with 'addr' in the currently active mm.
  */
@@ -150,7 +134,7 @@ void show_pte(unsigned long addr)
 	pgd_t *pgdp;
 	pgd_t pgd;
 
-	if (is_ttbr0_addr(addr)) {
+	if (addr < TASK_SIZE) {
 		/* TTBR0 */
 		mm = current->active_mm;
 		if (mm == &init_mm) {
@@ -158,7 +142,7 @@ void show_pte(unsigned long addr)
 				 addr);
 			return;
 		}
-	} else if (is_ttbr1_addr(addr)) {
+	} else if (addr >= VA_START) {
 		/* TTBR1 */
 		mm = &init_mm;
 	} else {
@@ -264,7 +248,7 @@ static inline bool is_el1_permission_fault(unsigned int esr,
 	if (fsc_type == ESR_ELx_FSC_PERM)
 		return true;
 
-	if (is_ttbr0_addr(addr) && system_uses_ttbr0_pan())
+	if (addr < TASK_SIZE && system_uses_ttbr0_pan())
 		return fsc_type == ESR_ELx_FSC_FAULT &&
 			(regs->pstate & PSR_PAN_BIT);
 
@@ -276,18 +260,8 @@ static void die_kernel_fault(const char *msg, unsigned long addr,
 {
 	bust_spinlocks(1);
 
-#ifdef CONFIG_SEC_DEBUG_AUTO_COMMENT
-	pr_auto(ASL1, "Unable to handle kernel %s at virtual address %016lx\n", msg,
-		 addr);
-#else
 	pr_alert("Unable to handle kernel %s at virtual address %016lx\n", msg,
 		 addr);
-#endif
-
-#ifdef CONFIG_SEC_DEBUG_EXTRA_INFO
-	sec_debug_set_extra_info_fault(addr, regs);
-	sec_debug_set_extra_info_esr(esr);
-#endif
 
 	mem_abort_decode(esr);
 
@@ -339,7 +313,7 @@ static void __do_user_fault(struct siginfo *info, unsigned int esr)
 	 * type", so we ignore this wrinkle and just return the translation
 	 * fault.)
 	 */
-	if (!is_ttbr0_addr(current->thread.fault_address)) {
+	if (current->thread.fault_address >= TASK_SIZE) {
 		switch (ESR_ELx_EC(esr)) {
 		case ESR_ELx_EC_DABT_LOW:
 			/*
@@ -480,7 +454,7 @@ static int __kprobes do_page_fault(unsigned long addr, unsigned int esr,
 		mm_flags |= FAULT_FLAG_WRITE;
 	}
 
-	if (is_ttbr0_addr(addr) && is_el1_permission_fault(esr, regs, addr)) {
+	if (addr < TASK_SIZE && is_el1_permission_fault(esr, regs, addr)) {
 		/* regs->orig_addr_limit may be 0 if we entered from EL0 */
 		if (regs->orig_addr_limit == KERNEL_DS)
 			die_kernel_fault("access to user memory with fs=KERNEL_DS",
@@ -496,14 +470,6 @@ static int __kprobes do_page_fault(unsigned long addr, unsigned int esr,
 	}
 
 	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, addr);
-
-	/*
-	 * let's try a speculative page fault without grabbing the
-	 * mmap_sem.
-	 */
-	fault = handle_speculative_fault(mm, addr, mm_flags, vm_flags);
-	if (fault != VM_FAULT_RETRY)
-		goto done;
 
 	/*
 	 * As per x86, we may deadlock here. However, since the kernel only
@@ -554,8 +520,6 @@ retry:
 		}
 	}
 	up_read(&mm->mmap_sem);
-
-done:
 
 	/*
 	 * Handle the "normal" (no error) case first.
@@ -636,31 +600,11 @@ no_context:
 	return 0;
 }
 
-int __weak do_tlb_conf_fault(unsigned long addr,
-			     unsigned int esr,
-			     struct pt_regs *regs)
-{
-	return 1; /* do_bad default */
-}
-
-int (*do_tlb_conf_fault_cb)(unsigned long addr,
-			    unsigned int esr,
-			    struct pt_regs *regs)
-	= do_tlb_conf_fault; /* initialization saves us a branch */
-EXPORT_SYMBOL_GPL(do_tlb_conf_fault_cb);
-
-static int _do_tlb_conf_fault(unsigned long addr,
-			      unsigned int esr,
-			      struct pt_regs *regs)
-{
-	return (*do_tlb_conf_fault_cb)(addr, esr, regs);
-}
-
 static int __kprobes do_translation_fault(unsigned long addr,
 					  unsigned int esr,
 					  struct pt_regs *regs)
 {
-	if (is_ttbr0_addr(addr))
+	if (addr < TASK_SIZE)
 		return do_page_fault(addr, esr, regs);
 
 	do_bad_area(addr, esr, regs);
@@ -685,6 +629,7 @@ static int do_sea(unsigned long addr, unsigned int esr, struct pt_regs *regs)
 	const struct fault_info *inf;
 
 	inf = esr_to_fault_info(esr);
+
 	/*
 	 * Synchronous aborts may interrupt code which had interrupts masked.
 	 * Before calling out into the wider kernel tell the interested
@@ -699,13 +644,6 @@ static int do_sea(unsigned long addr, unsigned int esr, struct pt_regs *regs)
 		if (interrupts_enabled(regs))
 			nmi_exit();
 	}
-
-#ifdef CONFIG_SEC_DEBUG_EXTRA_INFO
-	if (!user_mode(regs)) {
-		sec_debug_set_extra_info_fault(addr, regs);
-		sec_debug_set_extra_info_esr(esr);
-	}
-#endif
 
 	clear_siginfo(&info);
 	info.si_signo = inf->sig;
@@ -769,7 +707,7 @@ static const struct fault_info fault_info[] = {
 	{ do_bad,		SIGKILL, SI_KERNEL,	"unknown 45"			},
 	{ do_bad,		SIGKILL, SI_KERNEL,	"unknown 46"			},
 	{ do_bad,		SIGKILL, SI_KERNEL,	"unknown 47"			},
-	{ _do_tlb_conf_fault,	SIGKILL, SI_KERNEL,	"TLB conflict abort"		},
+	{ do_bad,		SIGKILL, SI_KERNEL,	"TLB conflict abort"		},
 	{ do_bad,		SIGKILL, SI_KERNEL,	"Unsupported atomic hardware update fault"	},
 	{ do_bad,		SIGKILL, SI_KERNEL,	"unknown 50"			},
 	{ do_bad,		SIGKILL, SI_KERNEL,	"unknown 51"			},
@@ -802,16 +740,7 @@ asmlinkage void __exception do_mem_abort(unsigned long addr, unsigned int esr,
 		return;
 
 	if (!user_mode(regs)) {
-#ifdef CONFIG_SEC_DEBUG_AUTO_COMMENT
-		pr_auto(ASL1, "Unhandled fault: %s (0x%08x) at 0x%016lx\n",
-		 						inf->name, esr, addr);
-#else
 		pr_alert("Unhandled fault at 0x%016lx\n", addr);
-#endif
-#ifdef CONFIG_SEC_DEBUG_EXTRA_INFO
-		sec_debug_set_extra_info_fault(addr, regs);
-		sec_debug_set_extra_info_esr(esr);
-#endif
 		mem_abort_decode(esr);
 		show_pte(addr);
 	}
@@ -839,7 +768,7 @@ asmlinkage void __exception do_el0_ia_bp_hardening(unsigned long addr,
 	 * re-enabled IRQs. If the address is a kernel address, apply
 	 * BP hardening prior to enabling IRQs and pre-emption.
 	 */
-	if (!is_ttbr0_addr(addr))
+	if (addr > TASK_SIZE)
 		arm64_apply_bp_hardening();
 
 	local_irq_enable();
@@ -854,27 +783,12 @@ asmlinkage void __exception do_sp_pc_abort(unsigned long addr,
 	struct siginfo info;
 
 	if (user_mode(regs)) {
-		if (!is_ttbr0_addr(instruction_pointer(regs)))
+		if (instruction_pointer(regs) > TASK_SIZE)
 			arm64_apply_bp_hardening();
 		local_irq_enable();
 	}
 
 	clear_siginfo(&info);
-
-#ifdef CONFIG_SEC_DEBUG_AUTO_COMMENT
-	if (!user_mode(regs))
-		pr_auto(ASL1, "%s exception: pc=0x%016llx sp=0x%016llx\n",
-				esr_get_class_string(esr),
-				regs->pc, regs->sp);
-#endif
-
-#ifdef CONFIG_SEC_DEBUG_EXTRA_INFO
-	if (!user_mode(regs)) {
-		sec_debug_set_extra_info_fault(addr, regs);
-		sec_debug_set_extra_info_esr(esr);
-	}
-#endif
-
 	info.si_signo = SIGBUS;
 	info.si_errno = 0;
 	info.si_code  = BUS_ADRALN;
@@ -961,7 +875,7 @@ asmlinkage int __exception do_debug_exception(unsigned long addr_if_watchpoint,
 	if (interrupts_enabled(regs))
 		trace_hardirqs_off();
 
-	if (user_mode(regs) && !is_ttbr0_addr(pc))
+	if (user_mode(regs) && pc > TASK_SIZE)
 		arm64_apply_bp_hardening();
 
 	if (!inf->fn(addr_if_watchpoint, esr, regs)) {

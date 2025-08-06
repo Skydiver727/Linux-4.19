@@ -92,11 +92,6 @@
 #include <linux/rodata_test.h>
 #include <linux/jump_label.h>
 #include <linux/mem_encrypt.h>
-#include <linux/bootprof.h>
-
-#ifdef CONFIG_SEC_BOOTSTAT
-#include <linux/sec_ext.h>
-#endif
 
 #include <asm/io.h>
 #include <asm/bugs.h>
@@ -106,11 +101,6 @@
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/initcall.h>
-
-#ifdef CONFIG_SECURITY_DEFEX
-#include <linux/defex.h>
-void __init __weak defex_load_rules(void) { }
-#endif
 
 static int kernel_init(void *);
 
@@ -143,7 +133,6 @@ void (*__initdata late_time_init)(void);
 char __initdata boot_command_line[COMMAND_LINE_SIZE];
 /* Untouched saved command line (eg. for /proc) */
 char *saved_command_line;
-EXPORT_SYMBOL_GPL(saved_command_line);
 /* Command line for parameter parsing */
 static char *static_command_line;
 /* Command line for per-initcall parameter parsing */
@@ -204,21 +193,13 @@ static bool __init obsolete_checksetup(char *line)
 			} else if (!p->setup_func) {
 				pr_warn("Parameter %s is obsolete, ignored\n",
 					p->str);
-				had_early_param = true;
-				goto fail;
-			} else {
-				set_memsize_reserved_name(p->str);
-				if (p->setup_func(line + n)) {
-					had_early_param = true;
-					goto fail;
-				}
-			}
+				return true;
+			} else if (p->setup_func(line + n))
+				return true;
 		}
 		p++;
 	} while (p < __setup_end);
 
-fail:
-	unset_memsize_reserved_name();
 	return had_early_param;
 }
 
@@ -471,13 +452,11 @@ static int __init do_early_param(char *param, char *val,
 		    (strcmp(param, "console") == 0 &&
 		     strcmp(p->str, "earlycon") == 0)
 		) {
-			set_memsize_reserved_name(p->str);
 			if (p->setup_func(val) != 0)
 				pr_warn("Malformed early option '%s'\n", param);
 		}
 	}
 	/* We accept everything at this stage. */
-	unset_memsize_reserved_name();
 	return 0;
 }
 
@@ -527,45 +506,17 @@ static inline void initcall_debug_enable(void)
 }
 #endif
 
-/* Report memory auto-initialization states for this boot. */
-static void __init report_meminit(void)
-{
-	const char *stack;
-
-	if (IS_ENABLED(CONFIG_INIT_STACK_ALL_PATTERN))
-		stack = "all(pattern)";
-	else if (IS_ENABLED(CONFIG_INIT_STACK_ALL_ZERO))
-		stack = "all(zero)";
-	else if (IS_ENABLED(CONFIG_GCC_PLUGIN_STRUCTLEAK_BYREF_ALL))
-		stack = "byref_all(zero)";
-	else if (IS_ENABLED(CONFIG_GCC_PLUGIN_STRUCTLEAK_BYREF))
-		stack = "byref(zero)";
-	else if (IS_ENABLED(CONFIG_GCC_PLUGIN_STRUCTLEAK_USER))
-		stack = "__user(zero)";
-	else
-		stack = "off";
-
-	pr_info("mem auto-init: stack:%s, heap alloc:%s, heap free:%s\n",
-		stack, want_init_on_alloc(GFP_KERNEL) ? "on" : "off",
-		want_init_on_free() ? "on" : "off");
-	if (want_init_on_free())
-		pr_info("mem auto-init: clearing system memory may take some time...\n");
-}
-
 /*
  * Set up kernel memory allocators
  */
 static void __init mm_init(void)
 {
-	set_memsize_kernel_type(MEMSIZE_KERNEL_MM_INIT);
 	/*
 	 * page_ext requires contiguous pages,
 	 * bigger than MAX_ORDER unless SPARSEMEM.
 	 */
 	page_ext_init_flatmem();
-	report_meminit();
 	mem_init();
-	set_memsize_kernel_type(MEMSIZE_KERNEL_STOP);
 	kmem_cache_init();
 	pgtable_init();
 	vmalloc_init();
@@ -581,7 +532,6 @@ asmlinkage __visible void __init start_kernel(void)
 	char *command_line;
 	char *after_dashes;
 
-	set_memsize_kernel_type(MEMSIZE_KERNEL_OTHERS);
 	set_task_stack_end_magic(&init_task);
 	smp_setup_processor_id();
 	debug_objects_early_init();
@@ -599,6 +549,13 @@ asmlinkage __visible void __init start_kernel(void)
 	page_address_init();
 	pr_notice("%s", linux_banner);
 	setup_arch(&command_line);
+	/*
+	 * Set up the the initial canary and entropy after arch
+	 * and after adding latent and command line entropy.
+	 */
+	add_latent_entropy();
+	add_device_randomness(command_line, strlen(command_line));
+	boot_init_stack_canary();
 	mm_init_cpumask(&init_mm);
 	setup_command_line(command_line);
 	setup_nr_cpu_ids();
@@ -630,10 +587,6 @@ asmlinkage __visible void __init start_kernel(void)
 	sort_main_extable();
 	trap_init();
 	mm_init();
-
-	#if defined(CONFIG_SEC_BOOTSTAT)
-		sec_boot_stat_get_start_kernel();
-	#endif
 
 	ftrace_init();
 
@@ -687,20 +640,6 @@ asmlinkage __visible void __init start_kernel(void)
 	hrtimers_init();
 	softirq_init();
 	timekeeping_init();
-
-	/*
-	 * For best initial stack canary entropy, prepare it after:
-	 * - setup_arch() for any UEFI RNG entropy and boot cmdline access
-	 * - timekeeping_init() for ktime entropy used in rand_initialize()
-	 * - rand_initialize() to get any arch-specific entropy like RDRAND
-	 * - add_latent_entropy() to get any latent entropy
-	 * - adding command line entropy
-	 */
-	rand_initialize();
-	add_latent_entropy();
-	add_device_randomness(command_line, strlen(command_line));
-	boot_init_stack_canary();
-
 	time_init();
 	perf_event_init();
 	profile_init();
@@ -932,28 +871,17 @@ static inline void do_trace_initcall_finish(initcall_t fn, int ret)
 }
 #endif /* !TRACEPOINTS_ENABLED */
 
-
 int __init_or_module do_one_initcall(initcall_t fn)
 {
 	int count = preempt_count();
 	char msgbuf[64];
 	int ret;
-#ifdef CONFIG_MTPROF
-	unsigned long long ts;
-#endif
 
 	if (initcall_blacklisted(fn))
 		return -EPERM;
 
-#ifdef CONFIG_MTK_RAM_CONSOLE
-	aee_rr_rec_last_init_func((unsigned long)fn);
-#endif
-
 	do_trace_initcall_start(fn);
-	BOOTPROF_TIME_LOG_START(ts);
 	ret = fn();
-	BOOTPROF_TIME_LOG_END(ts);
-	bootprof_initcall(fn, ts);
 	do_trace_initcall_finish(fn, ret);
 
 	msgbuf[0] = 0;
@@ -1022,10 +950,6 @@ static void __init do_initcall_level(int level)
 	trace_initcall_level(initcall_level_names[level]);
 	for (fn = initcall_levels[level]; fn < initcall_levels[level+1]; fn++)
 		do_one_initcall(initcall_from_entry(fn));
-
-#if defined(CONFIG_SEC_BOOTSTAT)
-  	sec_boot_stat_add_initcall(initcall_level_names[level]);
-#endif		
 }
 
 static void __init do_initcalls(void)
@@ -1154,8 +1078,6 @@ static int __ref kernel_init(void *unused)
 
 	rcu_end_inkernel_boot();
 
-	bootprof_log_boot("Kernel_init_done");
-
 	if (ramdisk_execute_command) {
 		ret = run_init_process(ramdisk_execute_command);
 		if (!ret)
@@ -1253,8 +1175,4 @@ static noinline void __init kernel_init_freeable(void)
 
 	integrity_load_keys();
 	load_default_modules();
-#ifdef CONFIG_SECURITY_DEFEX
-	defex_load_rules();
-#endif
-
 }

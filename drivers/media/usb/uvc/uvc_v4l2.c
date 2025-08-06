@@ -781,8 +781,7 @@ static int uvc_ioctl_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 	if (!uvc_has_privileges(handle))
 		return -EBUSY;
 
-	return uvc_queue_buffer(&stream->queue,
-				stream->vdev.v4l2_dev->mdev, buf);
+	return uvc_queue_buffer(&stream->queue, buf);
 }
 
 static int uvc_ioctl_expbuf(struct file *file, void *fh,

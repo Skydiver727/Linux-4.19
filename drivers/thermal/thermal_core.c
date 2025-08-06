@@ -91,73 +91,6 @@ static void bind_previous_governor(struct thermal_zone_device *tz,
 	}
 }
 
- /* [+Chk 127645,songyuanqiao@wingtech.com,add the thermal ntc 20220704] */
- /* Instruction
-  * @fled_notify_add() - send "add" to fmk, and called in driver
-  * @fled_return_value: global variable, is assigned in the driver
-  * @temp_state_show() - read the node of "sys/class/thermal/thermal_message/temp_state" info (0 or 1)
-  * @uevent path: /devices/virtual/thermal/thermal_message
-  */
-  #ifdef CONFIG_WT_FLASH_THERMAL_FEATURE
-  int fled_return_value = 0;
-  static struct device *device_scfg;
-  static char *fled_warn_add[2]={"FLED_WARN_STATE=add", NULL};
-  static char *fled_warn_remove[2]={"FLED_WARN_STATE=remove", NULL};
-  
-  void fled_notify_add(void)
-  {
-		kobject_uevent_env(&device_scfg->kobj, KOBJ_CHANGE, fled_warn_add);
-		pr_info("[EveD][T] Fled add uevent called success! ");
-  }
-  
-  void fled_notify_remove(void)
-  {
-		kobject_uevent_env(&device_scfg->kobj, KOBJ_CHANGE, fled_warn_remove);
-        pr_info("[EveD][T] Fled rm uevent called success! ");
-  }
-  
-  static ssize_t
-   temp_state_show(struct device *dev, struct device_attribute *attr, char *buf)
-  {
-		pr_info("[EveD][T]temp_state flag value = %d\n", fled_return_value);
-		return sprintf(buf, "%d\n", fled_return_value);
-  }
-  
-  static DEVICE_ATTR(temp_state, 0664, temp_state_show, NULL);
-
-  /* +bug733919, yexiaojun.wt, MODIFY, 20220527,modify the flashlight NTC temp warning threshhold */ 
-  int threshold_val=80000; 
-  /* -bug733919, yexiaojun.wt, MODIFY, 20220527,modify the flashlight NTC temp warning threshhold */
- 
- static ssize_t
-   fled_temp_warning_show(struct device *dev, struct device_attribute *attr, char *buf)
-  {
-  	int val; 
-    val = threshold_val;
-  	return sprintf(buf, "%d\n", val);
-  }
-  
-  static ssize_t
-   fled_temp_warning_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
-  {
-	int result;
-	if (kstrtoint(buf, 10, &result))
-		return -EINVAL;
-  
-	if (result < 30000) {		
-  		threshold_val = 52000; 		
-  		pr_info("[EveD][T]Fled temp threshold value cannot less than 30 degree!\n");
-  	} else
-  		threshold_val=result;
-  
-  	pr_info("[EveD][T]You want to set fled temp threshold value to %d, and threshold has to be %d!\n", result, threshold_val);
-  
-  	return count;
-  }
-  
-  static DEVICE_ATTR(fled_temp_warning, 0664, fled_temp_warning_show, fled_temp_warning_store);
-  #endif
-  /* [-Chk 127645,songyuanqiao@wingtech.com,add the thermal ntc 20220704]*/
 /**
  * thermal_set_governor() - Switch to another governor
  * @tz:		a valid pointer to a struct thermal_zone_device
@@ -314,10 +247,6 @@ static int __init thermal_register_governors(void)
 {
 	int result;
 
-	result = thermal_gov_backward_compatible_register();
-	if (result)
-		return result;
-
 	result = thermal_gov_step_wise_register();
 	if (result)
 		return result;
@@ -339,7 +268,6 @@ static int __init thermal_register_governors(void)
 
 static void thermal_unregister_governors(void)
 {
-	thermal_gov_backward_compatible_unregister();
 	thermal_gov_step_wise_unregister();
 	thermal_gov_fair_share_unregister();
 	thermal_gov_bang_bang_unregister();
@@ -496,23 +424,6 @@ static void handle_thermal_trip(struct thermal_zone_device *tz, int trip)
 	monitor_thermal_zone(tz);
 }
 
-static void store_temperature(struct thermal_zone_device *tz, int temp)
-{
-	mutex_lock(&tz->lock);
-	tz->last_temperature = tz->temperature;
-	tz->temperature = temp;
-	mutex_unlock(&tz->lock);
-
-	trace_thermal_temperature(tz);
-	if (tz->last_temperature == THERMAL_TEMP_INVALID ||
-		tz->last_temperature == THERMAL_TEMP_INVALID_LOW)
-		dev_dbg(&tz->device, "last_temperature N/A, current_temperature=%d\n",
-			tz->temperature);
-	else
-		dev_dbg(&tz->device, "last_temperature=%d, current_temperature=%d\n",
-			tz->last_temperature, tz->temperature);
-}
-
 static void update_temperature(struct thermal_zone_device *tz)
 {
 	int temp, ret;
@@ -525,7 +436,19 @@ static void update_temperature(struct thermal_zone_device *tz)
 				 ret);
 		return;
 	}
-	store_temperature(tz, temp);
+
+	mutex_lock(&tz->lock);
+	tz->last_temperature = tz->temperature;
+	tz->temperature = temp;
+	mutex_unlock(&tz->lock);
+
+	trace_thermal_temperature(tz);
+	if (tz->last_temperature == THERMAL_TEMP_INVALID)
+		dev_dbg(&tz->device, "last_temperature N/A, current_temperature=%d\n",
+			tz->temperature);
+	else
+		dev_dbg(&tz->device, "last_temperature=%d, current_temperature=%d\n",
+			tz->last_temperature, tz->temperature);
 }
 
 static void thermal_zone_device_init(struct thermal_zone_device *tz)
@@ -542,38 +465,12 @@ static void thermal_zone_device_reset(struct thermal_zone_device *tz)
 	thermal_zone_device_init(tz);
 }
 
-void thermal_zone_device_update_temp(struct thermal_zone_device *tz,
-				enum thermal_notify_event event, int temp)
-{
-	int count;
-
-	if (!tz || !tz->ops)
-		return;
-
-	if (atomic_read(&in_suspend) && (!tz->ops->is_wakeable ||
-					 !(tz->ops->is_wakeable(tz))))
-		return;
-
-	store_temperature(tz, temp);
-
-	thermal_zone_set_trips(tz);
-
-	tz->notify_event = event;
-
-	for (count = 0; count < tz->trips; count++)
-		handle_thermal_trip(tz, count);
-}
-
 void thermal_zone_device_update(struct thermal_zone_device *tz,
 				enum thermal_notify_event event)
 {
 	int count;
 
-	if (!tz || !tz->ops)
-		return;
-
-	if (atomic_read(&in_suspend) && (!tz->ops->is_wakeable ||
-		!(tz->ops->is_wakeable(tz))))
+	if (atomic_read(&in_suspend))
 		return;
 
 	if (!tz->ops->get_temp)
@@ -839,9 +736,8 @@ int thermal_zone_bind_cooling_device(struct thermal_zone_device *tz,
 	sprintf(dev->attr_name, "cdev%d_trip_point", dev->id);
 	sysfs_attr_init(&dev->attr.attr);
 	dev->attr.attr.name = dev->attr_name;
-	dev->attr.attr.mode = 0644;
+	dev->attr.attr.mode = 0444;
 	dev->attr.show = trip_point_show;
-	dev->attr.store = trip_point_store;
 	result = device_create_file(&tz->device, &dev->attr);
 	if (result)
 		goto remove_symbol_link;
@@ -1045,7 +941,7 @@ static void bind_cdev(struct thermal_cooling_device *cdev)
  */
 static struct thermal_cooling_device *
 __thermal_cooling_device_register(struct device_node *np,
-				  const char *type, void *devdata,
+				  char *type, void *devdata,
 				  const struct thermal_cooling_device_ops *ops)
 {
 	struct thermal_cooling_device *cdev;
@@ -1119,7 +1015,7 @@ __thermal_cooling_device_register(struct device_node *np,
  * ERR_PTR. Caller must check return value with IS_ERR*() helpers.
  */
 struct thermal_cooling_device *
-thermal_cooling_device_register(const char *type, void *devdata,
+thermal_cooling_device_register(char *type, void *devdata,
 				const struct thermal_cooling_device_ops *ops)
 {
 	return __thermal_cooling_device_register(NULL, type, devdata, ops);
@@ -1143,7 +1039,7 @@ EXPORT_SYMBOL_GPL(thermal_cooling_device_register);
  */
 struct thermal_cooling_device *
 thermal_of_cooling_device_register(struct device_node *np,
-				   const char *type, void *devdata,
+				   char *type, void *devdata,
 				   const struct thermal_cooling_device_ops *ops)
 {
 	return __thermal_cooling_device_register(np, type, devdata, ops);
@@ -1374,7 +1270,6 @@ thermal_zone_device_register(const char *type, int trips, int mask,
 		if (result)
 			goto unregister;
 	}
-	INIT_DELAYED_WORK(&tz->poll_queue, thermal_zone_device_check);
 
 	mutex_lock(&thermal_list_lock);
 	list_add_tail(&tz->node, &thermal_tz_list);
@@ -1383,6 +1278,7 @@ thermal_zone_device_register(const char *type, int trips, int mask,
 	/* Bind cooling devices for this zone */
 	bind_tz(tz);
 
+	INIT_DELAYED_WORK(&tz->poll_queue, thermal_zone_device_check);
 
 	thermal_zone_device_reset(tz);
 	/* Update the new thermal zone and mark it as already updated. */
@@ -1431,8 +1327,6 @@ void thermal_zone_device_unregister(struct thermal_zone_device *tz)
 		mutex_unlock(&thermal_list_lock);
 		return;
 	}
-	/* force stop pending/running delayed work */
-	cancel_delayed_work_sync(&(tz->poll_queue));
 	list_del(&tz->node);
 
 	/* Unbind all cdevs associated with 'this' thermal zone */
@@ -1504,43 +1398,6 @@ exit:
 	return ref;
 }
 EXPORT_SYMBOL_GPL(thermal_zone_get_zone_by_name);
-
-/**
- * thermal_zone_get_cdev_by_name() - search for a cooling device and returns
- * its ref.
- * @name: thermal cdev name to fetch the temperature
- *
- * When only one cdev is found with the passed name, returns a reference to it.
- *
- * Return: On success returns a reference to an unique thermal cooling device
- * with matching name equals to @name, an ERR_PTR otherwise (-EINVAL for
- * invalid paramenters, -ENODEV for not found and -EEXIST for multiple matches).
- */
-struct thermal_cooling_device *thermal_zone_get_cdev_by_name(const char *name)
-{
-	struct thermal_cooling_device *pos = NULL, *ref = ERR_PTR(-EINVAL);
-	unsigned int found = 0;
-
-	if (!name)
-		return ref;
-
-	mutex_lock(&thermal_list_lock);
-	list_for_each_entry(pos, &thermal_cdev_list, node)
-		if (!strncasecmp(name, pos->type, THERMAL_NAME_LENGTH)) {
-			found++;
-			ref = pos;
-		}
-	mutex_unlock(&thermal_list_lock);
-
-	/* nothing has been found, thus an error code for it */
-	if (found == 0)
-		return ERR_PTR(-ENODEV);
-	if (found > 1)
-		return ERR_PTR(-EEXIST);
-	return ref;
-
-}
-EXPORT_SYMBOL_GPL(thermal_zone_get_cdev_by_name);
 
 #ifdef CONFIG_NET
 static const struct genl_multicast_group thermal_event_mcgrps[] = {
@@ -1647,17 +1504,12 @@ static int thermal_pm_notify(struct notifier_block *nb,
 	case PM_POST_HIBERNATION:
 	case PM_POST_RESTORE:
 	case PM_POST_SUSPEND:
-		mutex_lock(&thermal_list_lock);
 		atomic_set(&in_suspend, 0);
 		list_for_each_entry(tz, &thermal_tz_list, node) {
-			if (tz->ops && tz->ops->is_wakeable &&
-			    tz->ops->is_wakeable(tz))
-				continue;
 			thermal_zone_device_init(tz);
 			thermal_zone_device_update(tz,
 						   THERMAL_EVENT_UNSPECIFIED);
 		}
-		mutex_unlock(&thermal_list_lock);
 		break;
 	default:
 		break;
@@ -1673,11 +1525,6 @@ static int __init thermal_init(void)
 {
 	int result;
 
-	//[+Chk 127645,songyuanqiao@wingtech.com,add the thermal ntc 20220704]
-	#ifdef CONFIG_WT_FLASH_THERMAL_FEATURE
-	device_scfg = kzalloc(sizeof(struct device), GFP_KERNEL);
-	#endif
-    //[-Chk 127645,songyuanqiao@wingtech.com,add the thermal ntc 20220704]
 	mutex_init(&poweroff_lock);
 	result = thermal_register_governors();
 	if (result)
@@ -1687,25 +1534,6 @@ static int __init thermal_init(void)
 	if (result)
 		goto unregister_governors;
 
-	/*[+Chk 127645,songyuanqiao@wingtech.com,add the thermal ntc 20220704] */
-	#ifdef CONFIG_WT_FLASH_THERMAL_FEATURE
-  	dev_set_name(device_scfg, "thermal_message");
-  	device_scfg->class = &thermal_class;
-  
-  	result = device_register(device_scfg);
-  	if (result)
-  		goto unregister_class;
-  
-  	result = device_create_file(device_scfg, &dev_attr_temp_state);
-  	if (result)
-  		goto unregister_class;
-   
-	result = device_create_file(device_scfg, &dev_attr_fled_temp_warning);
-    if (result)
-         goto unregister_class;	
-	#endif
-	/* [-Chk 127645,songyuanqiao@wingtech.com,add the thermal ntc 20220704] */
-		
 	result = genetlink_init();
 	if (result)
 		goto unregister_class;
